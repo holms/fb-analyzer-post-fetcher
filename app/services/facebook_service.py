@@ -1,7 +1,8 @@
 import os
 import logging
-import facebook
-from typing import List, Optional
+import json
+import httpx
+from typing import List, Optional, Dict, Any
 from datetime import datetime
 from sqlalchemy.orm import Session
 
@@ -24,11 +25,16 @@ class FacebookService:
         self.app_secret = os.getenv("FACEBOOK_APP_SECRET")
         self.access_token = os.getenv("FACEBOOK_ACCESS_TOKEN")
         
-        # Configure Facebook Graph API client
+        # Configure Facebook API client
+        if not self.app_id or not self.app_secret:
+            logger.warning("Facebook app credentials not provided. Some functionality may be limited.")
+            
         if not self.access_token:
             logger.warning("Facebook access token not provided. Some functionality may be limited.")
         
-        self.graph = facebook.GraphAPI(access_token=self.access_token, version="v18.0")
+        # Base URL for Graph API requests with access token
+        self.graph_api_version = "v17.0"
+        self.graph_api_base = f"https://graph.facebook.com/{self.graph_api_version}"
         
         # Configure service settings from environment variables
         self.max_pages_per_fetch = int(os.getenv("MAX_PAGES_PER_FETCH", "10"))
@@ -46,10 +52,11 @@ class FacebookService:
         
         # Try to get page info from Facebook
         try:
-            page_info = self.graph.get_object(
-                id=page.fb_page_id,
-                fields="name,description,link"
-            )
+            url = f"{self.graph_api_base}/{page.fb_page_id}?fields=name,description,link&access_token={self.access_token}"
+            with httpx.Client() as client:
+                response = client.get(url)
+                response.raise_for_status()
+                page_info = response.json()
             
             # Update page data with info from Facebook
             if not page.name and "name" in page_info:
@@ -59,7 +66,7 @@ class FacebookService:
             if not page.page_url and "link" in page_info:
                 page.page_url = page_info["link"]
                 
-        except facebook.GraphAPIError as e:
+        except httpx.HTTPError as e:
             logger.error(f"Failed to fetch page info from Facebook: {e}")
             # Continue with provided data
         
@@ -114,13 +121,13 @@ class FacebookService:
         events = []
         
         try:
-            # Get events from Facebook
-            event_data = self.graph.get_connections(
-                id=db_page.fb_page_id,
-                connection_name="events",
-                fields="id,name,description,start_time,end_time,place,is_online,attending_count,interested_count",
-                limit=min(limit, self.max_events_per_page)
-            )
+            # Get events from Facebook using the Graph API
+            fields = "id,name,description,start_time,end_time,place,is_online,attending_count,interested_count"
+            url = f"{self.graph_api_base}/{db_page.fb_page_id}/events?fields={fields}&limit={min(limit, self.max_events_per_page)}&access_token={self.access_token}"
+            with httpx.Client() as client:
+                response = client.get(url)
+                response.raise_for_status()
+                event_data = response.json()
             
             # Process each event
             for event in event_data.get("data", []):
@@ -139,11 +146,31 @@ class FacebookService:
                 end_time = None
                 try:
                     if start_time_str:
-                        start_time = datetime.fromisoformat(start_time_str.replace("Z", "+00:00"))
+                        # Handle various date formats from Facebook API
+                        # Format 1: 2025-03-15T16:00:00+0200 (missing colon in timezone)
+                        # Format 2: 2025-03-15T16:00:00Z (UTC timezone)
+                        if start_time_str.endswith('Z'):
+                            start_time_str = start_time_str.replace("Z", "+00:00")
+                        elif '+' in start_time_str and ':' not in start_time_str[-5:]:
+                            # Insert colon in timezone: +0200 -> +02:00
+                            tz_part = start_time_str[-5:]
+                            formatted_tz = f"{tz_part[:3]}:{tz_part[3:]}"
+                            start_time_str = start_time_str[:-5] + formatted_tz
+                        
+                        start_time = datetime.fromisoformat(start_time_str)
+                        
                     if end_time_str:
-                        end_time = datetime.fromisoformat(end_time_str.replace("Z", "+00:00"))
+                        # Apply the same formatting to end_time
+                        if end_time_str.endswith('Z'):
+                            end_time_str = end_time_str.replace("Z", "+00:00")
+                        elif '+' in end_time_str and ':' not in end_time_str[-5:]:
+                            tz_part = end_time_str[-5:]
+                            formatted_tz = f"{tz_part[:3]}:{tz_part[3:]}"
+                            end_time_str = end_time_str[:-5] + formatted_tz
+                            
+                        end_time = datetime.fromisoformat(end_time_str)
                 except ValueError as e:
-                    logger.warning(f"Failed to parse event time: {e}")
+                    logger.warning(f"Failed to parse event time: {e} (value: {start_time_str})")
                 
                 # Extract location
                 location = None
@@ -189,7 +216,7 @@ class FacebookService:
                 
                 events.append(EventResponse.from_orm(db_event))
             
-        except facebook.GraphAPIError as e:
+        except httpx.HTTPError as e:
             logger.error(f"Failed to fetch events from Facebook: {e}")
         
         return events
