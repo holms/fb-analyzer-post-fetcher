@@ -6,7 +6,7 @@ httpx==0.24.0
 redis==4.5.4
 mysqlclient==2.1.1
 sqlalchemy==2.0.9
-facebook-sdk==3.1.0
+# Using httpx instead of requests
 tenacity==8.2.2
 pytest==7.3.1
 pytest-asyncio==0.21.0
